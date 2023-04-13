@@ -237,10 +237,8 @@ int main(int argc, char** argv) {
 			take_slice(i, data["experts_b2"].data<float>(), expert_b2_dims)
 		});
 	}
-
-	// ... and so it begins ...
-
-	// Create memory descriptors and memory objects
+	
+  // Create memory descriptors and memory objects
 	auto src_desc = memory::desc(src_dims, dt::f32, tag::ab);
 	auto dst_desc = memory::desc(dst_dims, dt::f32, tag::ab);
 
@@ -253,10 +251,10 @@ int main(int argc, char** argv) {
 
 	// Memory used by concat primitive to create an expert's input (and output)
 #if defined(CONCAT_INDEX_SELECT) || defined(CONCAT_INDEX_RESTORE)
-	std::vector<memory::desc> concat_src_desc;
+	std::vector<memory::desc> concat_src_descs;
 	std::vector<memory> concat_src_mems;
 
-	concat_src_desc.reserve(token_count);
+	concat_src_descs.reserve(token_count);
 	concat_src_mems.reserve(token_count);
 	std::unordered_map<int, memory> concat_args;
 #endif
@@ -270,40 +268,92 @@ int main(int argc, char** argv) {
 	expert_dst_mems.reserve(expert_count);
 #endif
 
-	for (size_t i = 0; i < expert_count; ++i) {
-		// Token count per expert, so we know how much memory to allocate
-		memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](memory::dim acc, float val) {
-			return acc + (val ? 1 : 0);
-		});
+  // Initialize descriptors and memory handlers used by experts
 
-		std::cout << "Expert " << i << " gets " << expert_token_count << " tokens\n";
-
-		auto expert_src_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
-		auto expert_src_mem = memory(expert_src_desc, engine);
+  std::vector<memory::desc> expert_w1_descs, expert_w2_descs;
+  std::vector<memory> expert_w1_mems, expert_w2_mems;
+  
+  std::vector<memory::desc> expert_b1_descs, expert_b2_descs;
+  std::vector<memory> expert_b1_mems, expert_b2_mems;
+		
+  std::vector<memory::desc> expert_src_descs;
+	std::vector<memory> expert_src_mems;
 		
 		// Temporary memory used for expert's intermediate result
-		auto expert_tmp_desc = memory::desc({expert_token_count, expert_size}, dt::f32, tag::ab);
-		auto expert_tmp_mem = memory(expert_tmp_desc, engine);
+	std::vector<memory::desc> expert_tmp_descs;
+	std::vector<memory> expert_tmp_mems;
+	
+  std::vector<memory::dim> expert_token_counts;
 
-#ifdef CONCAT_INDEX_RESTORE
-		// Expert output memory, to be selectively added to dst_mem eventually.
-		// We keep them around in vectors so we can use them later in the final concat.
-		auto expert_dst_desc = expert_dst_descs.emplace_back(memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab));
-		auto expert_dst_mem = expert_dst_mems.emplace_back(memory(expert_dst_desc, engine));
-#else
-		// Expert output memory, to be selectively added to dst_mem eventually
-		auto expert_dst_desc = memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab);
-		auto expert_dst_mem = memory(expert_dst_desc, engine);
-#endif
+  for (size_t i = 0; i < expert_count; ++i) {
+		
+    // Token count per expert, so we know how much memory to allocate
+    memory::dim expert_token_count = std::accumulate(&router[token_count * i], &router[token_count * (i + 1)], 0, [](memory::dim acc, float val) {
+			return acc + (val ? 1 : 0);
+		});
+	  expert_token_counts.push_back(expert_token_count);
 
-		// Cut short excluded experts. Bit late, but at this point the expert will
-		// at least appear in the exert_dst_descs list.
+    // Expert weights and biases (these are all the same shape for every expert)
+		expert_w1_descs.emplace_back(memory::desc(expert_w1_dims, dt::f32, tag::ab));
+		expert_w1_mems.emplace_back(memory(expert_w1_descs[i], engine, experts[i].w1.data()));
+		
+		expert_b1_descs.emplace_back(memory::desc(expert_b1_dims, dt::f32, tag::ab));
+		expert_b1_mems.emplace_back(memory(expert_b1_descs[i], engine, experts[i].b1.data()));
+
+		expert_w2_descs.emplace_back(memory::desc(expert_w2_dims, dt::f32, tag::ab));
+		expert_w2_mems.emplace_back(memory(expert_w2_descs[i], engine, experts[i].w2.data()));
+		
+		expert_b2_descs.emplace_back(memory::desc(expert_b2_dims, dt::f32, tag::ab));
+		expert_b2_mems.emplace_back(memory(expert_b2_descs[i], engine, experts[i].b2.data()));
+		
+    expert_src_descs.emplace_back(memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab));
+		expert_src_mems.emplace_back(memory(expert_src_descs[i], engine));
+		
+		expert_tmp_descs.emplace_back(memory::desc({expert_token_count, expert_size}, dt::f32, tag::ab));
+		expert_tmp_mems.emplace_back(memory(expert_tmp_descs[i], engine));
+
+// #ifdef CONCAT_INDEX_RESTORE
+    // Expert output memory, to be selectively added to dst_mem eventually.
+    // We keep them around in vectors so we can use them later in the final concat.
+    expert_dst_descs.emplace_back(memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab));
+    expert_dst_mems.emplace_back(memory(expert_dst_descs[i], engine));
+// #else
+    // // Expert output memory, to be selectively added to dst_mem eventually
+    // expert_dst_descs.emplace_back(memory::desc({expert_token_count, embedding_size}, dt::f32, tag::ab));
+    // expert_dst_mems.emplace_back(memory(expert_dst_desc, engine));
+// #endif
+
+	}
+
+	// ... and so it begins ...
+
+  // BIG LOOP HERE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+	for (size_t i = 0; i < expert_count; ++i) {
+		// Token count per expert, so we know how much memory to allocate
+		auto expert_token_count = expert_token_counts[i];
+		
+    // Cut short excluded experts. Bit late, but at this point the expert will
+		// at least appear in the expert_dst_descs list.
 		if (expert_token_count == 0)
 			continue;
 
+		std::cout << "Expert " << i << " gets " << expert_token_count << " tokens\n";
+
+		auto expert_src_desc = expert_src_descs[i];
+		auto expert_src_mem = expert_src_mems[i];
+		
+		// Temporary memory used for expert's intermediate result
+		auto expert_tmp_desc = expert_tmp_descs[i];
+		auto expert_tmp_mem = expert_tmp_mems[i];
+
+		auto expert_dst_desc = expert_dst_descs[i];
+		auto expert_dst_mem = expert_dst_mems[i];
+
+
 #ifdef CONCAT_INDEX_SELECT
 		// === oneDNN call to concat() to select rows for expert ===
-		concat_src_desc.clear();
+		concat_src_descs.clear();
 		concat_src_mems.clear();
 		concat_args.clear();
 
@@ -312,13 +362,13 @@ int main(int argc, char** argv) {
 				continue;
 
 			// make the dnnl::memory object a view of a small part of the original input memory
-			concat_src_desc.emplace_back(src_desc.submemory_desc(memory::dims{1, embedding_size}, {j, 0}));
-			concat_src_mems.emplace_back(concat_src_desc.back(), engine, src_mem.get_data_handle());
+			concat_src_descs.emplace_back(src_desc.submemory_desc(memory::dims{1, embedding_size}, {j, 0}));
+			concat_src_mems.emplace_back(concat_src_descs.back(), engine, src_mem.get_data_handle());
 			concat_args.insert({DNNL_ARG_MULTIPLE_SRC + (concat_src_mems.size() - 1), concat_src_mems.back()});
 		}
 
 		// Create concat primitive descriptor.
-		auto concat_desc = concat::primitive_desc(engine, 0, concat_src_desc);
+		auto concat_desc = concat::primitive_desc(engine, 0, concat_src_descs);
 		auto concat_prim = concat(concat_desc);
 
 		concat_args.insert({DNNL_ARG_DST, expert_src_mem});
@@ -357,18 +407,18 @@ int main(int argc, char** argv) {
 			{DNNL_ARG_DST, expert_dst_mem}
 		});
 
-		// Expert weights and biases (these are all the same shape for every expert)
-		auto expert_w1_desc = memory::desc(expert_w1_dims, dt::f32, tag::ab);
-		auto expert_w1_mem = memory(expert_w1_desc, engine, experts[i].w1.data());
-		
-		auto expert_b1_desc = memory::desc(expert_b1_dims, dt::f32, tag::ab);
-		auto expert_b1_mem = memory(expert_b1_desc, engine, experts[i].b1.data());
+    // Expert weights and biases (these are all the same shape for every expert)
+    auto expert_w1_desc = expert_w1_descs[i];
+    auto expert_w1_mem = expert_w1_mems[i];
+    
+    auto expert_b1_desc = expert_b1_descs[i];
+    auto expert_b1_mem = expert_b1_mems[i];
 
-		auto expert_w2_desc = memory::desc(expert_w2_dims, dt::f32, tag::ab);
-		auto expert_w2_mem = memory(expert_w2_desc, engine, experts[i].w2.data());
-		
-		auto expert_b2_desc = memory::desc(expert_b2_dims, dt::f32, tag::ab);
-		auto expert_b2_mem = memory(expert_b2_desc, engine, experts[i].b2.data());
+    auto expert_w2_desc = expert_w2_descs[i];
+    auto expert_w2_mem = expert_w2_mems[i];
+    
+    auto expert_b2_desc = expert_b2_descs[i];
+    auto expert_b2_mem = expert_b2_mems[i];
 
 		const float alpha = 0.f;
 		const float beta = 0.f;
@@ -447,7 +497,7 @@ int main(int argc, char** argv) {
 	}
 
 #ifdef CONCAT_INDEX_RESTORE
-	concat_src_desc.clear();
+	concat_src_descs.clear();
 	concat_src_mems.clear();
 	concat_args.clear();
 
@@ -474,13 +524,13 @@ int main(int argc, char** argv) {
 		std::cerr << "Taking token " << j << " from expert " << expert_i << std::endl;
 
 		// make the dnnl::memory object a view of a small part of the original expert's output memory
-		concat_src_desc.emplace_back(expert_dst_descs[expert_i].submemory_desc(memory::dims{1, embedding_size}, {expert_offsets[expert_i]++, 0}));
-		concat_src_mems.emplace_back(concat_src_desc.back(), engine, expert_dst_mems[expert_i].get_data_handle());
+		concat_src_descs.emplace_back(expert_dst_descs[expert_i].submemory_desc(memory::dims{1, embedding_size}, {expert_offsets[expert_i]++, 0}));
+		concat_src_mems.emplace_back(concat_src_descs.back(), engine, expert_dst_mems[expert_i].get_data_handle());
 		concat_args.insert({DNNL_ARG_MULTIPLE_SRC + (concat_src_mems.size() - 1), concat_src_mems.back()});
 	}
 
 	// Create concat primitive descriptor.
-	auto concat_desc = concat::primitive_desc(engine, 0, concat_src_desc);
+	auto concat_desc = concat::primitive_desc(engine, 0, concat_src_descs);
 	auto concat_prim = concat(concat_desc);
 
 	// output to the final massive matrix
